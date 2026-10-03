@@ -7,22 +7,27 @@ from decimal import Decimal
 
 from trading.models import Stock, TradingSignal, RebalanceEvent
 from trading.services.momentum_calculator import get_momentum_calculator
-from trading.services.snaptrade_client import get_trading_executor
 from portfolio.models import Portfolio, Position
 
 logger = logging.getLogger(__name__)
 
 
 class MomentumTradingStrategy:
+    CASH_BUFFER = Decimal("0.05")  # share of cash never allocated to new buys
+
     def __init__(self, portfolio: Portfolio):
         self.portfolio = portfolio
         self.momentum_calculator = get_momentum_calculator()
-        self.trading_executor = get_trading_executor()
         self.rebalance_frequency = getattr(settings, "REBALANCE_FREQUENCY", "weekly")
+
+    def get_available_cash(self) -> Decimal:
+        return self.portfolio.current_cash * (1 - self.CASH_BUFFER)
 
     def should_rebalance(self) -> bool:
         last_rebalance = (
-            RebalanceEvent.objects.filter(execution_status="COMPLETED")
+            RebalanceEvent.objects.filter(
+                portfolio=self.portfolio, execution_status="COMPLETED"
+            )
             .order_by("-date")
             .first()
         )
@@ -39,14 +44,20 @@ class MomentumTradingStrategy:
         else:
             return False
 
-    def execute_rebalance(self, calculation_date: datetime = None) -> RebalanceEvent:
+    def execute_rebalance(
+        self, calculation_date: datetime = None, dry_run: bool = True
+    ) -> RebalanceEvent:
+        if not dry_run:
+            raise NotImplementedError("Live execution arrives with the broker adapters")
+
         if calculation_date is None:
             calculation_date = timezone.now().date()
 
-        logger.info(f"Starting rebalance for {calculation_date}")
+        logger.info(f"Starting dry-run rebalance for {calculation_date}")
 
         # Create rebalance event
         rebalance_event = RebalanceEvent.objects.create(
+            portfolio=self.portfolio,
             date=calculation_date,
             total_stocks_analyzed=0,
             buy_signals_generated=0,
@@ -54,39 +65,39 @@ class MomentumTradingStrategy:
             execution_status="IN_PROGRESS",
         )
 
-        # Step 1: Update stock universe and calculate momentum scores
-        stocks = self.momentum_calculator.update_stock_universe()
-        momentum_scores = self.momentum_calculator.calculate_momentum_scores_bulk(
-            stocks, calculation_date
-        )
+        try:
+            # Step 1: Update stock universe and calculate momentum scores
+            stocks = self.momentum_calculator.update_stock_universe()
+            momentum_scores = self.momentum_calculator.calculate_momentum_scores_bulk(
+                stocks, calculation_date
+            )
 
-        rebalance_event.total_stocks_analyzed = len(momentum_scores)
+            rebalance_event.total_stocks_analyzed = len(momentum_scores)
 
-        # Step 2: Rank stocks and determine quintiles
-        ranked_scores = self.momentum_calculator.rank_stocks_by_momentum(
-            calculation_date
-        )
+            # Step 2: Rank stocks and determine quintiles
+            self.momentum_calculator.rank_stocks_by_momentum(calculation_date)
 
-        # Step 3: Generate trading signals
-        buy_signals, sell_signals = self.generate_trading_signals(calculation_date)
+            # Step 3: Generate trading signals
+            buy_signals, sell_signals = self.generate_trading_signals(calculation_date)
 
-        rebalance_event.buy_signals_generated = len(buy_signals)
-        rebalance_event.sell_signals_generated = len(sell_signals)
-        rebalance_event.save()
+            rebalance_event.buy_signals_generated = len(buy_signals)
+            rebalance_event.sell_signals_generated = len(sell_signals)
 
-        # Step 4: Execute trades
-        self.execute_trading_signals(buy_signals, sell_signals, rebalance_event)
+            # Step 4: Update portfolio value
+            self.portfolio.calculate_total_value()
+            self.portfolio.save()
 
-        # Step 5: Update portfolio value
-        self.portfolio.calculate_total_value()
-        self.portfolio.save()
+            rebalance_event.total_portfolio_value = self.portfolio.total_value
+            rebalance_event.execution_status = "DRY_RUN"
+            rebalance_event.completed_at = timezone.now()
+            rebalance_event.save()
+        except Exception as e:
+            rebalance_event.execution_status = "FAILED"
+            rebalance_event.error_message = str(e)
+            rebalance_event.save()
+            raise
 
-        rebalance_event.total_portfolio_value = self.portfolio.total_value
-        rebalance_event.execution_status = "COMPLETED"
-        rebalance_event.completed_at = timezone.now()
-        rebalance_event.save()
-
-        logger.info(f"Rebalance completed successfully for {calculation_date}")
+        logger.info(f"Dry-run rebalance finished for {calculation_date}")
 
         return rebalance_event
 
@@ -95,6 +106,11 @@ class MomentumTradingStrategy:
     ) -> Tuple[List[TradingSignal], List[TradingSignal]]:
         if calculation_date is None:
             calculation_date = timezone.now().date()
+
+        # Re-running a date replaces its unexecuted signals instead of piling up duplicates
+        TradingSignal.objects.filter(
+            signal_date=calculation_date, is_executed=False
+        ).delete()
 
         # Get current portfolio positions
         current_positions = {
@@ -134,9 +150,7 @@ class MomentumTradingStrategy:
                 sell_signals.append(sell_signal)
 
         # Generate buy signals for top quintile stocks not in portfolio
-        available_cash = self.trading_executor.get_available_cash_for_trading(
-            self.portfolio
-        )
+        available_cash = self.get_available_cash()
 
         # Filter out stocks already in portfolio
         buy_candidates = [
@@ -174,50 +188,18 @@ class MomentumTradingStrategy:
         sell_signals: List[TradingSignal],
         rebalance_event: RebalanceEvent,
     ):
-        # Execute sell orders first to free up cash
-        sell_stocks = [signal.stock for signal in sell_signals]
-        sell_trades = self.trading_executor.execute_sell_orders(
-            self.portfolio, sell_stocks
-        )
-
-        # Mark sell signals as executed
-        for signal in sell_signals:
-            signal.is_executed = True
-            signal.executed_at = timezone.now()
-            signal.save()
-
-        # Calculate total value available for buying
-        # This includes current cash plus proceeds from sells
-        total_sell_value = sum(
-            signal.target_value for signal in sell_signals if signal.target_value
-        )
-
-        available_for_buying = self.portfolio.current_cash + total_sell_value
-
-        # Execute buy orders
-        buy_stocks = [signal.stock for signal in buy_signals]
-        buy_trades = []
-        if buy_stocks and available_for_buying > 0:
-            buy_trades = self.trading_executor.execute_buy_orders(
-                self.portfolio, buy_stocks, available_for_buying
-            )
-
-            # Mark buy signals as executed
-            for signal in buy_signals:
-                signal.is_executed = True
-                signal.executed_at = timezone.now()
-                signal.save()
-
-        logger.info(
-            f"Executed {len(sell_trades)} sell orders and {len(buy_trades)} buy orders"
-        )
+        # Phase C: place sells first, wait for them to fill, then size the buys
+        # from the cash that actually arrived (not from assumed proceeds).
+        raise NotImplementedError("Live execution arrives with the broker adapters")
 
     def get_strategy_performance(self, days_back: int = 30) -> Dict:
         start_date = timezone.now().date() - timedelta(days=days_back)
 
         # Get recent rebalance events
         recent_rebalances = RebalanceEvent.objects.filter(
-            date__gte=start_date, execution_status="COMPLETED"
+            portfolio=self.portfolio,
+            date__gte=start_date,
+            execution_status="COMPLETED",
         ).order_by("-date")
 
         # Get recent trading signals
@@ -265,24 +247,13 @@ class MomentumTradingStrategy:
     def validate_strategy_setup(self) -> Dict:
         validation_result = {"is_valid": True, "issues": [], "warnings": []}
 
-        # Check portfolio setup
-        if not self.portfolio.snaptrade_user_id:
-            validation_result["issues"].append("Portfolio missing SnapTrade user ID")
-            validation_result["is_valid"] = False
-
-        if not self.portfolio.snaptrade_account_id:
-            validation_result["issues"].append("Portfolio missing SnapTrade account ID")
-            validation_result["is_valid"] = False
+        # Check portfolio setup (dry runs need no broker, live trading will)
+        if not self.portfolio.broker:
+            validation_result["warnings"].append("Portfolio has no broker set")
 
         # Check API keys
         if not settings.MASSIVE_API_KEY:
             validation_result["issues"].append("Massive API key not configured")
-            validation_result["is_valid"] = False
-
-        if not settings.SNAPTRADE_CLIENT_ID or not settings.SNAPTRADE_CLIENT_SECRET:
-            validation_result["issues"].append(
-                "SnapTrade API credentials not configured"
-            )
             validation_result["is_valid"] = False
 
         # Check data availability

@@ -1,7 +1,7 @@
 from django.conf import settings
 from massive import RESTClient
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 import logging
 import time
@@ -76,7 +76,9 @@ class MassiveAPIClient:
                 ):
                     aggs.append(
                         {
-                            "date": datetime.fromtimestamp(agg.timestamp / 1000).date(),
+                            "date": datetime.fromtimestamp(
+                                agg.timestamp / 1000, tz=timezone.utc
+                            ).date(),
                             "open": agg.open,
                             "high": agg.high,
                             "low": agg.low,

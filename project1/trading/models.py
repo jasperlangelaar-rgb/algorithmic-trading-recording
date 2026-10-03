@@ -27,6 +27,10 @@ class PriceData(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["stock", "date"], name="uniq_stock_date")
+        ]
 
 class MomentumScore(models.Model):
     stock = models.ForeignKey(
@@ -81,7 +85,7 @@ class TradingSignal(models.Model):
     momentum_score = models.ForeignKey(
         MomentumScore, on_delete=models.CASCADE, null=True
     )
-    target_quantity = models.IntegerField(null=True, blank=True)
+    target_quantity = models.DecimalField(max_digits=18, decimal_places=6, null=True, blank=True)
     target_value = models.DecimalField(
         max_digits=12, decimal_places=2, null=True, blank=True
     )
@@ -113,6 +117,7 @@ class RebalanceEvent(models.Model):
             ("PENDING", "Pending"),
             ("IN_PROGRESS", "In Progress"),
             ("COMPLETED", "Completed"),
+            ("DRY_RUN", "Dry run"),
             ("FAILED", "Failed"),
         ],
         default="PENDING",
@@ -120,3 +125,6 @@ class RebalanceEvent(models.Model):
     error_message = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True)
+    portfolio = models.ForeignKey(
+        "portfolio.Portfolio", on_delete=models.CASCADE, related_name="rebalance_events"
+    )
