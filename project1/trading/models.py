@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 
 
@@ -45,29 +45,36 @@ class MomentumScore(models.Model):
     period_end = models.DateField()
     created_at = models.DateTimeField(auto_now_add=True)
 
+    MIN_SCORES_FOR_QUINTILES = 5
+
     @classmethod
     def calculate_quintiles_for_date(cls, calculation_date=None):
         if calculation_date is None:
             calculation_date = timezone.now().date()
 
-        # Get all momentum scores for the calculation date
-        scores = cls.objects.filter(calculation_date=calculation_date).order_by(
-            "-momentum_score"
+        # Highest momentum first; ticker breaks ties so reruns are reproducible.
+        scores = list(
+            cls.objects.filter(calculation_date=calculation_date)
+            .select_related("stock")
+            .order_by("-momentum_score", "stock__ticker")
         )
-
-        if not scores.exists():
+        n = len(scores)
+        if n == 0:
             return
+        if n < cls.MIN_SCORES_FOR_QUINTILES:
+            raise ValueError(
+                f"Need at least {cls.MIN_SCORES_FOR_QUINTILES} scores to form "
+                f"quintiles, got {n}"
+            )
 
-        total_stocks = scores.count()
-        quintile_size = total_stocks // 5
-
-        # Update quintiles and rankings
         for i, score in enumerate(scores):
             score.rank = i + 1
-            quintile = min(5, (i // quintile_size) + 1) if quintile_size > 0 else 1
-            score.quintile = quintile
+            # Quintile 1 = HIGHEST momentum, 5 = lowest. Bucket sizes differ by at most 1.
+            score.quintile = i * 5 // n + 1
             score.is_top_quintile = score.quintile == 1
-            score.save(update_fields=["rank", "quintile", "is_top_quintile"])
+
+        with transaction.atomic():
+            cls.objects.bulk_update(scores, ["rank", "quintile", "is_top_quintile"])
 
 
 class TradingSignal(models.Model):

@@ -9,6 +9,7 @@ import logging
 
 from trading.models import Stock, PriceData, MomentumScore
 from trading.services.massive_client import get_massive_client
+from dateutil.relativedelta import relativedelta
 
 logger = logging.getLogger(__name__)
 
@@ -19,27 +20,41 @@ class MomentumCalculator:
         self.lookback_months = getattr(settings, "MOMENTUM_LOOKBACK_MONTHS", 12)
         self.skip_months = getattr(settings, "MOMENTUM_SKIP_MONTHS", 1)
 
+    def get_period(self, calculation_date, lookback_months=None, skip_months=None):
+        """Return (period_start, period_end): the two price dates momentum compares.
+
+        Momentum = return from (date - lookback months) to (date - skip months),
+        e.g. 12 and 1 give the classic "12-1" momentum. Calendar months; the
+        as-of price lookup steps back over weekends and holidays.
+        """
+        lookback = self.lookback_months if lookback_months is None else lookback_months
+        skip = self.skip_months if skip_months is None else skip_months
+        if lookback <= skip:
+            raise ValueError("lookback_months must be greater than skip_months")
+        return (
+            calculation_date - relativedelta(months=lookback),
+            calculation_date - relativedelta(months=skip),
+        )
+
     def calculate_momentum_for_stock(
         self, stock: Stock, calculation_date: datetime = None
     ) -> Optional[Decimal]:
         if calculation_date is None:
             calculation_date = timezone.now().date()
 
-        # Get required dates
-        twelve_months_ago = calculation_date - timedelta(days=365)
-        one_month_ago = calculation_date - timedelta(days=30)
+        period_start, period_end = self.get_period(calculation_date)
 
         # Prices come from the database only (see pull_prices); missing data is
         # reported, never silently filled from the API.
-        price_12m = self._get_price_from_db(stock, twelve_months_ago, tolerance_days=7)
-        price_1m = self._get_price_from_db(stock, one_month_ago, tolerance_days=7)
+        price_start = self._get_price_from_db(stock, period_start, tolerance_days=7)
+        price_end = self._get_price_from_db(stock, period_end, tolerance_days=7)
 
-        if price_12m and price_1m and price_12m > 0:
-            return (price_1m - price_12m) / price_12m
+        if price_start and price_end and price_start > 0:
+            return (price_end - price_start) / price_start
 
         logger.warning(
             f"Could not calculate momentum for {stock.ticker}: "
-            f"price_12m={price_12m}, price_1m={price_1m}"
+            f"price_start={price_start}, price_end={price_end}"
         )
         return None
 
@@ -72,6 +87,7 @@ class MomentumCalculator:
             stock_list = Stock.objects.filter(is_active=True)
 
         momentum_scores = []
+        period_start, period_end = self.get_period(calculation_date)
 
         for stock in stock_list:
             momentum = self.calculate_momentum_for_stock(stock, calculation_date)
@@ -83,8 +99,8 @@ class MomentumCalculator:
                 calculation_date=calculation_date,
                 defaults={
                     "momentum_score": momentum,
-                    "period_start": calculation_date - timedelta(days=365),
-                    "period_end": calculation_date - timedelta(days=30),
+                    "period_start": period_start,
+                    "period_end": period_end,
                 },
             )
             momentum_scores.append(momentum_score)
@@ -107,9 +123,9 @@ class MomentumCalculator:
         # Calculate quintiles for the date
         MomentumScore.calculate_quintiles_for_date(calculation_date)
 
-        # Return ranked scores
+        # Return ranked scores (rank 1 = highest momentum)
         return MomentumScore.objects.filter(calculation_date=calculation_date).order_by(
-            "-momentum_score"
+            "rank"
         )
 
     def get_top_quintile_stocks(self, calculation_date: datetime = None) -> List[Stock]:
@@ -225,22 +241,21 @@ class MomentumCalculator:
         if calculation_date is None:
             calculation_date = timezone.now().date()
 
-        twelve_months_ago = calculation_date - timedelta(days=365)
-        one_month_ago = calculation_date - timedelta(days=30)
+        period_start, period_end = self.get_period(calculation_date)
 
         validation_result = {
             "stock": stock.ticker,
             "calculation_date": calculation_date,
             "has_sufficient_data": False,
-            "price_12m": None,
-            "price_1m": None,
+            "period_start": period_start,
+            "period_end": period_end,
             "momentum_score": None,
             "data_points_available": 0,
         }
 
         # Check data availability
         data_count = stock.price_data.filter(
-            date__gte=twelve_months_ago, date__lte=calculation_date
+            date__gte=period_start, date__lte=calculation_date
         ).count()
 
         validation_result["data_points_available"] = data_count

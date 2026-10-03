@@ -125,5 +125,8 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 MASSIVE_API_KEY = config("MASSIVE_API_KEY", default="")
+# Momentum = return from (date - LOOKBACK months) to (date - SKIP months).
+# 12 and 1 give the classic "12-1" momentum (the latest month is skipped on
+# purpose: short-term reversal). pull_prices --days must cover the lookback.
 MOMENTUM_LOOKBACK_MONTHS = 12
 MOMENTUM_SKIP_MONTHS = 1
